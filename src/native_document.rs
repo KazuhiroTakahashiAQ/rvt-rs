@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Read,
+    sync::Arc,
 };
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
@@ -302,6 +303,34 @@ pub fn extract_graphs(
         emit,
     )
 }
+/// Extract the current records of `options.selected_ids` as
+/// [`extract_graphs`] does, walking only the partitions that hold one.
+/// Where each record of `options.channels` lies is found on the first call
+/// and memoised in `file`, so that reading a few records at a time does not
+/// walk the whole document each time. The summary's counts cover the
+/// partitions walked. `options.selected_classes` must be empty.
+pub fn extract_graphs_selected(
+    file: &mut RevitFile,
+    options: &Options,
+    emit: impl FnMut(Record) -> Result<()>,
+) -> Result<Summary> {
+    ensure!(
+        options.selected_classes.is_empty(),
+        "extract_graphs_selected selects by ids only"
+    );
+    extract_records_with(
+        file,
+        options,
+        false,
+        &crate::native_parameter_definitions::Registry::default(),
+        true,
+        emit,
+    )
+}
+
+/// The partitions holding each record, by `(channel, ElementId)`.
+pub type RecordHolders = BTreeMap<(u64, u64), BTreeSet<u32>>;
+
 /// A record group's records, `(id, offset, body start, body end)`: a
 /// 4-byte (Revit 2023) or 8-byte id, a header, the body and its length
 /// repeated after it. The group's declared object count and body bytes must
@@ -355,6 +384,20 @@ fn extract_records(
     options: &Options,
     definitions_only: bool,
     definitions: &crate::native_parameter_definitions::Registry,
+    emit: impl FnMut(Record) -> Result<()>,
+) -> Result<Summary> {
+    extract_records_with(file, options, definitions_only, definitions, false, emit)
+}
+
+/// [`extract_records`]; with `memoised_holders`, the first pass is made
+/// once for every record of the channels and kept in `file`, and the
+/// second walks only the partitions holding a selected record.
+fn extract_records_with(
+    file: &mut RevitFile,
+    options: &Options,
+    definitions_only: bool,
+    definitions: &crate::native_parameter_definitions::Registry,
+    memoised_holders: bool,
     mut emit: impl FnMut(Record) -> Result<()>,
 ) -> Result<Summary> {
     let version = file.basic_file_info()?.version;
@@ -439,8 +482,14 @@ fn extract_records(
     // differing pairs on Core Interior, 887 of 887 on Autodesk's 2021
     // `rac_advanced`). A first pass finds the partitions that hold each
     // selected element's records.
-    let mut holders: BTreeMap<(u64, u64), BTreeSet<u32>> = BTreeMap::new();
-    for name in &names {
+    let channel_key: Vec<u64> = options.channels.iter().copied().collect();
+    let memoised = if memoised_holders {
+        file.record_holders(&channel_key)
+    } else {
+        None
+    };
+    let mut holders: RecordHolders = BTreeMap::new();
+    for name in names.iter().filter(|_| memoised.is_none()) {
         let partition: u32 = name[11..].parse()?;
         let stored = file.read_stream_with_limit(name, options.max_stream_bytes)?;
         let prepared = compression::prepare_stream_for_inflate(name, &stored);
@@ -455,7 +504,7 @@ fn extract_records(
                     return Ok(());
                 }
                 for (id, _, start, end) in group_records(source, bytes, version)? {
-                    if is_selected(id, &bytes[start..end]) {
+                    if memoised_holders || is_selected(id, &bytes[start..end]) {
                         holders
                             .entry((source.channel, id))
                             .or_default()
@@ -466,6 +515,33 @@ fn extract_records(
             },
         )?;
     }
+    let holders = match memoised {
+        Some(memoised) => memoised,
+        None => {
+            let holders = Arc::new(holders);
+            if memoised_holders {
+                file.remember_record_holders(channel_key, Arc::clone(&holders));
+            }
+            holders
+        }
+    };
+    // Only the partitions holding a selected record, where known.
+    let names: Vec<String> = if memoised_holders {
+        let wanted: BTreeSet<u32> = options
+            .channels
+            .iter()
+            .flat_map(|&channel| selected.iter().map(move |&id| (channel, id)))
+            .filter_map(|key| holders.get(&key))
+            .flatten()
+            .copied()
+            .collect();
+        names
+            .into_iter()
+            .filter(|name| name[11..].parse().is_ok_and(|p: u32| wanted.contains(&p)))
+            .collect()
+    } else {
+        names
+    };
     let mut seen = BTreeSet::new();
     let mut seen_ids = BTreeSet::new();
     for name in names {
