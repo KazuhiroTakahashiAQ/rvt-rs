@@ -266,6 +266,19 @@ impl RevitFile {
         self.limits
     }
 
+    /// Drop what the handle memoised besides the inflated streams and the
+    /// native extraction preamble, which reading native records needs again
+    /// (B82): the string records, element names, design options, walk and
+    /// data objects an export reads. They are computed again when asked for.
+    pub fn release_export_caches(&mut self) {
+        self.partition_strings = None;
+        self.second_prologue_ids = None;
+        self.element_names = None;
+        self.design_options = None;
+        self.walk = None;
+        self.data_objects.clear();
+    }
+
     /// Read and inflate every gzip member of `name`, memoised.
     ///
     /// Repeat calls return the same shared buffer instead of reading
