@@ -210,6 +210,9 @@ pub struct InflatedStream {
     /// Each member's offset in the prepared stream and the bytes its gzip
     /// header and DEFLATE stream take there (B82).
     members: Vec<(usize, usize)>,
+    /// Each member's CRC-32, computed the first time a walk of the
+    /// partition checks it against the member's gzip trailer, for the next.
+    crcs: Vec<std::sync::OnceLock<u32>>,
 }
 
 impl InflatedStream {
@@ -230,10 +233,14 @@ impl InflatedStream {
             chunk_ends.push(concat.len());
             members.push((*offset, *consumed));
         }
+        let crcs = (0..members.len())
+            .map(|_| std::sync::OnceLock::new())
+            .collect();
         Self {
             concat,
             chunk_ends,
             members,
+            crcs,
         }
     }
 
@@ -241,12 +248,31 @@ impl InflatedStream {
     /// prepared stream ([`prepare_stream_for_inflate`]), with the bytes its
     /// header and DEFLATE stream take there (B82).
     pub fn member_at(&self, offset: usize) -> Option<(&[u8], usize)> {
-        let i = self
-            .members
+        let i = self.member_index(offset)?;
+        Some((self.member(i), self.members[i].1))
+    }
+
+    /// [`Self::member_at`], with the member's CRC-32 (computed once).
+    pub fn member_with_crc_at(&self, offset: usize) -> Option<(&[u8], usize, u32)> {
+        let i = self.member_index(offset)?;
+        let member = self.member(i);
+        let crc = *self.crcs[i].get_or_init(|| {
+            let mut crc = flate2::Crc::new();
+            crc.update(member);
+            crc.sum()
+        });
+        Some((member, self.members[i].1, crc))
+    }
+
+    fn member_index(&self, offset: usize) -> Option<usize> {
+        self.members
             .binary_search_by_key(&offset, |&(start, _)| start)
-            .ok()?;
+            .ok()
+    }
+
+    fn member(&self, i: usize) -> &[u8] {
         let start = i.checked_sub(1).map_or(0, |prev| self.chunk_ends[prev]);
-        Some((&self.concat[start..self.chunk_ends[i]], self.members[i].1))
+        &self.concat[start..self.chunk_ends[i]]
     }
 
     /// The inflated members, concatenated in stored order.
