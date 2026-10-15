@@ -682,7 +682,9 @@ pub fn read_field_by_type(
             }
             let char_count = u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]) as usize;
             let byte_count = char_count.saturating_mul(2);
-            if slice.len() < 4 + byte_count {
+            // Checked: on a 32-bit target (wasm32) `4 + byte_count` wraps
+            // past the bounds test when `byte_count` saturates.
+            if byte_count.checked_add(4).is_none_or(|n| slice.len() < n) {
                 return InstanceField::Bytes(slice.to_vec());
             }
             let utf16_bytes = &slice[4..4 + byte_count];

@@ -175,6 +175,12 @@ fn u32_at(d: &[u8], at: usize) -> Option<u32> {
 /// table. When both fit equally, the one that leaves the shorter tail wins
 /// (a 40-byte table also fits at 28). Falls back to the 12-byte implicit
 /// layout from `0x30` when neither fits.
+///
+/// The table is ordered by each element's current ElementId, its record's
+/// second id ([`ElemRecord::id_secondary`], RE-41). The first id rises too
+/// on most files, but a renumbered element keeps an earlier id there: a
+/// Revit 2026 project (a recent build) has thousands such records of about 100,000,
+/// 169 of them out of order, so the ids of either field may rise.
 pub fn detect_layout(d: &[u8]) -> ElemTableLayout {
     let fallback = ElemTableLayout {
         start: 0x30,
@@ -190,15 +196,20 @@ pub fn detect_layout(d: &[u8]) -> ElemTableLayout {
         if end > d.len() {
             return None;
         }
-        let mut previous = None;
-        let mut rises = 0;
-        for k in 0..count {
-            let id = u32_at(d, RECORDS_ORIGIN + k * stride)?;
-            if previous.is_some_and(|p| id > p) {
-                rises += 1;
+        let rises_at = |field: usize| -> Option<usize> {
+            let mut previous = None;
+            let mut rises = 0;
+            for k in 0..count {
+                let id = u32_at(d, RECORDS_ORIGIN + k * stride + field)?;
+                if previous.is_some_and(|p| id > p) {
+                    rises += 1;
+                }
+                previous = Some(id);
             }
-            previous = Some(id);
-        }
+            Some(rises)
+        };
+        let second = record_fields(stride).map_or(0, |(second, _, _)| second);
+        let rises = rises_at(0)?.max(rises_at(second)?);
         Some((rises, d.len() - end))
     };
     let best = [40usize, 28]

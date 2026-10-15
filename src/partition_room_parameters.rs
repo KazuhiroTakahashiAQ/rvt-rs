@@ -289,7 +289,10 @@ pub fn data_objects(buf: &[u8]) -> Vec<(usize, DataObject)> {
     let mut p = 0;
     while p + DATA_OBJECT_HEADER <= buf.len() {
         let size = u32_at(p + 12) as usize;
-        let end = p + DATA_OBJECT_HEADER + size;
+        // Saturating: on a 32-bit target (wasm32) a large `size` wraps the
+        // sum below `buf.len()`, past the bounds test, and `end - 4`
+        // underflows.
+        let end = (p + DATA_OBJECT_HEADER).saturating_add(size);
         let plausible =
             u32_at(p + 4) == 0 && size >= 4 && end <= buf.len() && u32_at(end - 4) as usize == size;
         match plausible.then(|| verified_data_object(buf, p)).flatten() {
