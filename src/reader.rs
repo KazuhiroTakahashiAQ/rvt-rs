@@ -115,6 +115,9 @@ pub struct RevitFile {
     /// Memoised native extraction preamble (B82): each native consumer read
     /// the schema, the element index and the increments again.
     native_preamble: Option<Arc<crate::native_document::Preamble>>,
+    /// Memoised partitions holding each record of a set of channels, for
+    /// [`crate::native_document::extract_graphs_selected`].
+    record_holders: std::collections::HashMap<Vec<u64>, Arc<crate::native_document::RecordHolders>>,
 }
 
 /// A partition stream's data objects, each at its offset (RE-153).
@@ -256,6 +259,7 @@ impl RevitFile {
             walk: None,
             data_objects: std::collections::HashMap::new(),
             native_preamble: None,
+            record_holders: Default::default(),
         })
     }
 
@@ -264,6 +268,22 @@ impl RevitFile {
     /// bytes.
     pub fn limits(&self) -> OpenLimits {
         self.limits
+    }
+
+    /// The memoised record holders of `channels`, if any.
+    pub(crate) fn record_holders(
+        &self,
+        channels: &[u64],
+    ) -> Option<Arc<crate::native_document::RecordHolders>> {
+        self.record_holders.get(channels).cloned()
+    }
+
+    pub(crate) fn remember_record_holders(
+        &mut self,
+        channels: Vec<u64>,
+        holders: Arc<crate::native_document::RecordHolders>,
+    ) {
+        self.record_holders.insert(channels, holders);
     }
 
     /// Drop what the handle memoised besides the inflated streams and the
