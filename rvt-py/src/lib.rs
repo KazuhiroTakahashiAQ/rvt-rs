@@ -278,6 +278,7 @@ impl PyRevitFile {
                 max_output_bytes: max_inflate_bytes
                     .unwrap_or(default.inflate_limits.max_output_bytes),
             },
+            ..default
         };
         let walker_default = walker::WalkerLimits::default();
         let walker_limits = walker::WalkerLimits {

@@ -155,6 +155,64 @@ pub fn strip_revit_page_checksums(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// [`strip_revit_page_checksums`] as a reader: the payload of each full
+/// stored page of `inner` without its checksum trailer, and the short final
+/// page whole, read a page at a time.
+pub struct StrippedPages<R> {
+    inner: R,
+    page: Vec<u8>,
+    at: usize,
+    end: usize,
+    done: bool,
+}
+
+impl<R: Read> StrippedPages<R> {
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            page: vec![0; REVIT_STORED_PAGE_BYTES],
+            at: 0,
+            end: 0,
+            done: false,
+        }
+    }
+
+    /// Read the next stored page, or what is left of the stream.
+    fn fill(&mut self) -> std::io::Result<()> {
+        let mut got = 0;
+        while got < REVIT_STORED_PAGE_BYTES {
+            let n = self.inner.read(&mut self.page[got..])?;
+            if n == 0 {
+                break;
+            }
+            got += n;
+        }
+        self.done = got < REVIT_STORED_PAGE_BYTES;
+        self.at = 0;
+        self.end = if got == REVIT_STORED_PAGE_BYTES {
+            REVIT_PAGE_PAYLOAD_BYTES
+        } else {
+            got
+        };
+        Ok(())
+    }
+}
+
+impl<R: Read> Read for StrippedPages<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.at == self.end {
+            if self.done {
+                return Ok(0);
+            }
+            self.fill()?;
+        }
+        let n = buf.len().min(self.end - self.at);
+        buf[..n].copy_from_slice(&self.page[self.at..self.at + n]);
+        self.at += n;
+        Ok(n)
+    }
+}
+
 /// Return checksum-clean bytes ready for inflate when `stream_name` is gated.
 ///
 /// Does **not** mutate writer identity copies: [`crate::reader::RevitFile::read_stream`]
@@ -195,8 +253,8 @@ pub fn inflate_all_chunks_for_stream(stream_name: &str, stored: &[u8]) -> Vec<Ve
     inflate_all_chunks(prepared.as_ref())
 }
 
-/// Most inflated bytes one [`InflatedStream`] holds.
-const STREAM_INFLATE_BUDGET: usize = 1024 * 1024 * 1024;
+/// Default budget of inflated bytes one [`InflatedStream`] holds.
+pub const DEFAULT_MAX_INFLATED_STREAM_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Every gzip member of one stored stream, inflated and concatenated.
 ///
@@ -216,18 +274,37 @@ pub struct InflatedStream {
     /// Each member's CRC-32, computed the first time a walk of the
     /// partition checks it against the member's gzip trailer, for the next.
     crcs: Vec<std::sync::OnceLock<u32>>,
+    /// Whether members were left out for the inflated bytes' budget.
+    truncated: bool,
 }
 
 impl InflatedStream {
     /// Inflate every member of `stored` and concatenate them in order.
     pub fn from_stored(stream_name: &str, stored: &[u8]) -> Self {
         let prepared = prepare_stream_for_inflate(stream_name, stored);
-        let chunks = inflate_all_members_with_limits(
-            prepared.as_ref(),
-            InflateLimits::default(),
-            STREAM_INFLATE_BUDGET,
-        );
-        let total: usize = chunks.iter().map(|(_, _, chunk)| chunk.len()).sum();
+        Self::from_prepared(&prepared, DEFAULT_MAX_INFLATED_STREAM_BYTES)
+    }
+
+    /// Inflate every member of a prepared stream
+    /// ([`prepare_stream_for_inflate`]) and concatenate them in order, up to
+    /// `budget` inflated bytes.
+    pub fn from_prepared(prepared: &[u8], budget: usize) -> Self {
+        let mut total = 0usize;
+        let mut truncated = false;
+        let mut chunks = Vec::new();
+        for offset in find_gzip_offsets(prepared) {
+            let Ok((chunk, consumed)) =
+                inflate_member_at_with_limits(prepared, offset, InflateLimits::default())
+            else {
+                continue;
+            };
+            if total.saturating_add(chunk.len()) > budget {
+                truncated = true;
+                break;
+            }
+            total += chunk.len();
+            chunks.push((offset, consumed, chunk));
+        }
         let mut concat = Vec::with_capacity(total);
         let mut chunk_ends = Vec::with_capacity(chunks.len());
         let mut members = Vec::with_capacity(chunks.len());
@@ -236,6 +313,47 @@ impl InflatedStream {
             chunk_ends.push(concat.len());
             members.push((*offset, *consumed));
         }
+        Self::new(concat, chunk_ends, members, truncated)
+    }
+
+    /// [`Self::from_prepared`] holding only the members that start at the
+    /// offsets of `members` in the prepared stream, each with its ISIZE (its
+    /// gzip trailer's inflated length), in order: the document's own segments
+    /// of a partition ([`crate::native_segments::document_members`]). The
+    /// buffer is sized from the ISIZEs up front and each member appended as it
+    /// is inflated, so the stream is never held twice.
+    pub fn from_members(prepared: &[u8], members: &[(usize, u32)], budget: usize) -> Self {
+        let declared = members
+            .iter()
+            .map(|&(_, isize)| isize as usize)
+            .fold(0usize, usize::saturating_add);
+        let mut concat = Vec::with_capacity(declared.min(budget));
+        let mut chunk_ends = Vec::with_capacity(members.len());
+        let mut offsets = Vec::with_capacity(members.len());
+        let mut truncated = false;
+        for &(offset, _) in members {
+            let Ok((chunk, consumed)) =
+                inflate_member_at_with_limits(prepared, offset, InflateLimits::default())
+            else {
+                continue;
+            };
+            if concat.len().saturating_add(chunk.len()) > budget {
+                truncated = true;
+                break;
+            }
+            concat.extend_from_slice(&chunk);
+            chunk_ends.push(concat.len());
+            offsets.push((offset, consumed));
+        }
+        Self::new(concat, chunk_ends, offsets, truncated)
+    }
+
+    fn new(
+        concat: Vec<u8>,
+        chunk_ends: Vec<usize>,
+        members: Vec<(usize, usize)>,
+        truncated: bool,
+    ) -> Self {
         let crcs = (0..members.len())
             .map(|_| std::sync::OnceLock::new())
             .collect();
@@ -244,47 +362,14 @@ impl InflatedStream {
             chunk_ends,
             members,
             crcs,
+            truncated,
         }
     }
 
-    /// [`Self::from_stored`] holding only the members that start at the
-    /// offsets of `members` in the prepared stream, each with its ISIZE (its
-    /// gzip trailer's inflated length), in order: the document's own segments
-    /// of a partition ([`crate::native_segments::document_members`]). The
-    /// buffer is sized from the ISIZEs up front and each member appended as it
-    /// is inflated, so the stream is never held twice. The budgets are
-    /// [`Self::from_stored`]'s.
-    pub fn from_members(stream_name: &str, stored: &[u8], members: &[(usize, u32)]) -> Self {
-        let prepared = prepare_stream_for_inflate(stream_name, stored);
-        let declared = members
-            .iter()
-            .map(|&(_, isize)| isize as usize)
-            .fold(0usize, usize::saturating_add);
-        let mut concat = Vec::with_capacity(declared.min(STREAM_INFLATE_BUDGET));
-        let mut chunk_ends = Vec::with_capacity(members.len());
-        let mut offsets = Vec::with_capacity(members.len());
-        for &(offset, _) in members {
-            let Ok((chunk, consumed)) =
-                inflate_member_at_with_limits(prepared.as_ref(), offset, InflateLimits::default())
-            else {
-                continue;
-            };
-            if concat.len().saturating_add(chunk.len()) > STREAM_INFLATE_BUDGET {
-                break;
-            }
-            concat.extend_from_slice(&chunk);
-            chunk_ends.push(concat.len());
-            offsets.push((offset, consumed));
-        }
-        let crcs = (0..offsets.len())
-            .map(|_| std::sync::OnceLock::new())
-            .collect();
-        Self {
-            concat,
-            chunk_ends,
-            members: offsets,
-            crcs,
-        }
+    /// Whether members were left out because their inflated bytes would
+    /// have gone over the budget.
+    pub fn truncated(&self) -> bool {
+        self.truncated
     }
 
     /// The inflated member whose gzip header starts at `offset` of the
@@ -888,6 +973,32 @@ pub fn validate_truncated_gzip_prefix8_round_trip(bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stripped_pages_reads_what_strip_returns() {
+        for len in [
+            0,
+            5,
+            REVIT_STORED_PAGE_BYTES - 1,
+            REVIT_STORED_PAGE_BYTES,
+            REVIT_STORED_PAGE_BYTES + 1,
+            3 * REVIT_STORED_PAGE_BYTES + 777,
+        ] {
+            let stored: Vec<u8> = (0..len).map(|i| (i * 7 % 251) as u8).collect();
+            let mut read = Vec::new();
+            // Small reads, across page ends.
+            let mut pages = StrippedPages::new(&stored[..]);
+            let mut buf = [0u8; 1000];
+            loop {
+                let n = pages.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                read.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(read, strip_revit_page_checksums(&stored), "len {len}");
+        }
+    }
 
     #[test]
     fn detects_magic() {

@@ -8104,10 +8104,9 @@ fn partition_streams_largest_first(rf: &mut RevitFile) -> Vec<String> {
         .stream_names()
         .into_iter()
         .filter(|s| s.starts_with("Partitions/"))
-        .filter_map(|s| {
-            let raw = rf.read_stream(&s).ok()?;
-            Some((raw.len(), s))
-        })
+        // The stored size from the directory: reading every stream for its
+        // length held each whole, and one over the stream limit dropped out.
+        .filter_map(|s| Some((rf.stream_size(&s)? as usize, s)))
         .collect();
     streams.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     streams.into_iter().map(|(_, s)| s).collect()

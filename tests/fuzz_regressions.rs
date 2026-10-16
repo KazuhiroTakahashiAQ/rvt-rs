@@ -207,6 +207,7 @@ fn open_limits() -> OpenLimits {
         max_file_bytes: 16 * 1024 * 1024,
         max_stream_bytes: 4 * 1024 * 1024,
         inflate_limits: limits(),
+        ..OpenLimits::default()
     }
 }
 
