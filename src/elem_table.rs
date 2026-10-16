@@ -321,7 +321,17 @@ fn inflate(rf: &mut RevitFile) -> Result<Vec<u8>> {
 /// Parse all records from Global/ElemTable: the `u32` count at `0x02`
 /// records from `0x06`, at the record size [`detect_layout`] finds. On the
 /// implicit fallback layout the count is the header's `record_count`.
+/// Memoised on `rf`.
 pub fn parse_records(rf: &mut RevitFile) -> Result<Vec<ElemRecord>> {
+    if let Some(records) = rf.cached_elem_records() {
+        return Ok(records.as_ref().clone());
+    }
+    let records = read_records(rf)?;
+    rf.store_elem_records(std::sync::Arc::new(records.clone()));
+    Ok(records)
+}
+
+fn read_records(rf: &mut RevitFile) -> Result<Vec<ElemRecord>> {
     let d = inflate(rf)?;
     let header = parse_header_bytes(&d)?;
     let layout = detect_layout(&d);

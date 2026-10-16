@@ -192,7 +192,17 @@ fn map_at(
 /// material names they resolve to (RE-58). A type whose value block holds no
 /// map is present with no names (RE-84). Empty for a release whose
 /// element records are not decoded, or whose material names are not read.
+/// Memoised on `rf` for the last `revit_version`.
 pub fn type_material_names(rf: &mut RevitFile, revit_version: u32) -> BTreeMap<u32, Vec<String>> {
+    if let Some(names) = rf.cached_type_material_names(revit_version) {
+        return names.as_ref().clone();
+    }
+    let names = read_type_material_names(rf, revit_version);
+    rf.store_type_material_names(revit_version, std::sync::Arc::new(names.clone()));
+    names
+}
+
+fn read_type_material_names(rf: &mut RevitFile, revit_version: u32) -> BTreeMap<u32, Vec<String>> {
     if bbox_marker(revit_version).is_none() {
         return BTreeMap::new();
     }

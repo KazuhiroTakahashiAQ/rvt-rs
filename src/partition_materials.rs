@@ -358,7 +358,25 @@ fn closed_name(object: &[u8]) -> Option<String> {
 /// and so is a name read for two or more materials: Revit keeps material
 /// names unique, so one of them is misread. Empty for a release the layout
 /// is not measured on.
+/// Memoised on `rf` for the last `revit_version` and `declared`.
 pub fn scan_material_names(
+    rf: &mut RevitFile,
+    revit_version: u32,
+    declared: &BTreeSet<u32>,
+) -> Result<BTreeMap<u32, String>> {
+    if let Some(names) = rf.cached_material_names(revit_version, declared) {
+        return Ok(names.as_ref().clone());
+    }
+    let names = read_material_names(rf, revit_version, declared)?;
+    rf.store_material_names(
+        revit_version,
+        declared.clone(),
+        std::sync::Arc::new(names.clone()),
+    );
+    Ok(names)
+}
+
+fn read_material_names(
     rf: &mut RevitFile,
     revit_version: u32,
     declared: &BTreeSet<u32>,
