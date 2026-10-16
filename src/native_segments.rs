@@ -154,6 +154,113 @@ pub fn document_members(prepared: &[u8], tags: &MarkerTags) -> Result<Vec<(usize
     )?;
     Ok(members)
 }
+/// The checksum-stripped partition read from `pages` (a
+/// [`crate::compression::StrippedPages`]) with every keyed block left out:
+/// the bytes [`walk`] reads, less the documents of the loaded families
+/// (RE-148, RE-163), each block from its keyed `ContentMarker` to the next
+/// `ContentMarker`. A group never runs across a content marker, so what is
+/// kept walks as the whole stream does, its keyed groups aside. Reads the
+/// stream once and holds only what it keeps, at most `max_bytes`; the
+/// markers are read as [`walk`] reads them (the kept ones are checked again
+/// when walked).
+pub fn read_document_stream(
+    mut pages: impl Read,
+    tags: &MarkerTags,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let keep = |out: &mut Vec<u8>, bytes: &[u8]| -> Result<()> {
+        ensure!(
+            out.len().saturating_add(bytes.len()) <= max_bytes,
+            "partition's own segments exceed {max_bytes} bytes"
+        );
+        out.extend_from_slice(bytes);
+        Ok(())
+    };
+    let take = |pages: &mut dyn Read, n: usize| -> Result<Vec<u8>> {
+        let mut buf = vec![0; n];
+        pages.read_exact(&mut buf)?;
+        Ok(buf)
+    };
+    let u16_of = |b: &[u8]| u16::from_le_bytes([b[0], b[1]]);
+    let u32_of = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    let header = take(&mut pages, 8)?;
+    keep(&mut out, &header)?;
+    let mut keyed = false;
+    loop {
+        let tag_bytes = take(&mut pages, 2)?;
+        let tag = u16_of(&tag_bytes);
+        if tag == tags.content {
+            let token = take(&mut pages, 4)?;
+            let mut marker = tag_bytes.clone();
+            marker.extend_from_slice(&token);
+            if u32_of(&token) == 0 {
+                let count = take(&mut pages, 4)?;
+                marker.extend_from_slice(&count);
+                keyed = false;
+                keep(&mut out, &marker)?;
+                if u32_of(&count) == u32::MAX {
+                    // The opaque terminal: at most one storage page.
+                    let mut tail = Vec::new();
+                    (&mut pages)
+                        .take(crate::compression::REVIT_STORED_PAGE_BYTES as u64 + 1)
+                        .read_to_end(&mut tail)?;
+                    ensure!(
+                        tail.len() <= crate::compression::REVIT_STORED_PAGE_BYTES,
+                        "partition opaque terminal exceeds one storage page"
+                    );
+                    keep(&mut out, &tail)?;
+                    return Ok(out);
+                }
+            } else {
+                let key = take(&mut pages, 2 + 4 + 16)?;
+                ensure!(
+                    u32_of(&token) == u32::MAX && u16_of(&key) == tags.content_key,
+                    "unsupported content key pointer"
+                );
+                keyed = true;
+            }
+        } else if tag == tags.segment {
+            let fields = take(&mut pages, 16)?;
+            // The channel and the gzip member: `size` bytes after the
+            // fields, none for an empty segment.
+            let size = u32_of(&fields[8..]) as usize;
+            ensure!(size == 0 || size >= 18, "unsupported segment size");
+            if keyed {
+                let skipped =
+                    std::io::copy(&mut (&mut pages).take(size as u64), &mut std::io::sink())?;
+                ensure!(skipped == size as u64, "truncated partition segment");
+            } else {
+                keep(&mut out, &tag_bytes)?;
+                keep(&mut out, &fields)?;
+                let payload = take(&mut pages, size)?;
+                keep(&mut out, &payload)?;
+            }
+        } else if tag == tags.checkback {
+            let size = take(&mut pages, 4)?;
+            if !keyed {
+                keep(&mut out, &tag_bytes)?;
+                keep(&mut out, &size)?;
+            }
+        } else if Some(tag) == tags.signature {
+            let count = take(&mut pages, 4)?;
+            let n = u32_of(&count) as usize;
+            ensure!(n <= 1_000_000, "partition signature budget exceeded");
+            let bytes = take(&mut pages, n)?;
+            let units = take(&mut pages, 4)?;
+            let u = u32_of(&units) as usize;
+            ensure!(u <= 1_000_000, "partition signature string budget exceeded");
+            let text = take(&mut pages, u * 2)?;
+            if !keyed {
+                for part in [&tag_bytes[..], &count, &bytes, &units, &text] {
+                    keep(&mut out, part)?;
+                }
+            }
+        } else {
+            anyhow::bail!("unsupported partition marker {tag}");
+        }
+    }
+}
 /// The schema tags of the partition framing markers.
 #[derive(Debug, Clone, Copy)]
 pub struct MarkerTags {
@@ -378,5 +485,108 @@ fn walk_framing(
         } else {
             anyhow::bail!("unsupported partition marker {next} at {offset}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    const TAGS: MarkerTags = MarkerTags {
+        content: 0x10,
+        content_key: 0x11,
+        segment: 0x12,
+        checkback: 0x13,
+        signature: Some(0x14),
+    };
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn content(out: &mut Vec<u8>, key: Option<[u8; 16]>, count: u32) {
+        out.extend(TAGS.content.to_le_bytes());
+        match key {
+            None => {
+                out.extend(0u32.to_le_bytes());
+                out.extend(count.to_le_bytes());
+            }
+            Some(key) => {
+                out.extend(u32::MAX.to_le_bytes());
+                out.extend(TAGS.content_key.to_le_bytes());
+                out.extend(count.to_le_bytes());
+                out.extend(key);
+            }
+        }
+    }
+
+    /// One group of one segment, then its checkback.
+    fn segment(out: &mut Vec<u8>, channel: u64, body: &[u8]) {
+        let member = gzip(body);
+        let size = member.len() as u32 + 8;
+        out.extend(TAGS.segment.to_le_bytes());
+        out.extend((1u32 << 2).to_le_bytes());
+        out.extend(1u32.to_le_bytes());
+        out.extend(size.to_le_bytes());
+        out.extend((body.len() as u32).to_le_bytes());
+        out.extend(channel.to_le_bytes());
+        out.extend(&member);
+        out.extend(TAGS.checkback.to_le_bytes());
+        out.extend(size.to_le_bytes());
+    }
+
+    fn groups(prepared: &[u8]) -> Vec<(Option<[u8; 16]>, u64, Vec<u8>)> {
+        let mut out = Vec::new();
+        walk_framing(
+            prepared,
+            None,
+            &TAGS,
+            1 << 20,
+            Inflate::All,
+            &mut |_, _, _| {},
+            &mut |source, bytes| {
+                out.push((source.content_key, source.channel, bytes.to_vec()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        out
+    }
+
+    #[test]
+    fn document_stream_leaves_out_the_keyed_blocks() {
+        let mut stream = vec![0u8; 8];
+        content(&mut stream, None, 2);
+        segment(&mut stream, 101, b"project one");
+        segment(&mut stream, 102, b"project two");
+        content(&mut stream, Some([7; 16]), 1);
+        segment(&mut stream, 102, b"family");
+        content(&mut stream, None, 1);
+        segment(&mut stream, 103, b"project three");
+        content(&mut stream, None, u32::MAX);
+        stream.extend([0u8; 12]);
+
+        let document = read_document_stream(&stream[..], &TAGS, usize::MAX).unwrap();
+        assert!(document.len() < stream.len());
+        let unkeyed: Vec<_> = groups(&stream)
+            .into_iter()
+            .filter(|(key, _, _)| key.is_none())
+            .collect();
+        assert_eq!(groups(&document), unkeyed);
+        assert_eq!(unkeyed.len(), 3);
+        // Its members are those document_members finds in the whole stream.
+        let inflated = |prepared: &[u8]| {
+            let members = document_members(prepared, &TAGS).unwrap();
+            crate::compression::InflatedStream::from_members(prepared, &members, usize::MAX)
+                .bytes()
+                .to_vec()
+        };
+        assert_eq!(inflated(&document), inflated(&stream));
+        assert_eq!(inflated(&stream), b"project oneproject twoproject three");
+        // Over the budget, it is an error.
+        assert!(read_document_stream(&stream[..], &TAGS, 20).is_err());
     }
 }

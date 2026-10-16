@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
     fs::File,
-    io::{Cursor, Read},
+    io::{Cursor, Read, Seek, SeekFrom},
     path::Path,
     sync::Arc,
 };
@@ -39,6 +39,17 @@ pub const DEFAULT_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// with a claimed huge stream size will be rejected before a
 /// multi-GB allocation.
 pub const DEFAULT_MAX_STREAM_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Default for [`OpenLimits::max_inflated_partition_bytes`].
+pub const DEFAULT_MAX_INFLATED_PARTITION_BYTES: usize =
+    compression::DEFAULT_MAX_INFLATED_STREAM_BYTES;
+
+/// What a [`RevitFile`] reads the compound file from: its bytes in memory
+/// ([`RevitFile::open_bytes`]), or any reader that seeks, read as the
+/// streams are asked for ([`RevitFile::open_source_with_limits`]).
+/// `Send + Sync` for the Python bindings, whose objects move between threads.
+pub trait FileSource: Read + Seek + Send + Sync {}
+impl<T: Read + Seek + Send + Sync> FileSource for T {}
 
 /// Limits applied when opening a Revit file. Protects against
 /// pathological or hostile input that would otherwise force
@@ -62,6 +73,10 @@ pub struct OpenLimits {
     /// and open-limits consistent so a file opened under restrictive
     /// limits doesn't accidentally re-inflate under permissive ones.
     pub inflate_limits: compression::InflateLimits,
+    /// Most inflated bytes [`RevitFile::inflated_partition`] holds for one
+    /// partition; the members past it are left out, and the partition
+    /// noted in [`RevitFile::partition_issues`].
+    pub max_inflated_partition_bytes: usize,
 }
 
 impl Default for OpenLimits {
@@ -70,13 +85,14 @@ impl Default for OpenLimits {
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
             max_stream_bytes: DEFAULT_MAX_STREAM_BYTES,
             inflate_limits: compression::InflateLimits::default(),
+            max_inflated_partition_bytes: DEFAULT_MAX_INFLATED_PARTITION_BYTES,
         }
     }
 }
 
 /// Opened Revit file. Holds the CFB handle + cached stream bytes.
 pub struct RevitFile {
-    cfb: CompoundFile<Cursor<Vec<u8>>>,
+    cfb: CompoundFile<Box<dyn FileSource>>,
     /// Limits to apply on subsequent reads. Copied from the
     /// `OpenLimits` passed at construction; defaults to
     /// `OpenLimits::default()` for back-compat `open`/`open_bytes`.
@@ -90,6 +106,13 @@ pub struct RevitFile {
     /// the handle — `RevitFile` never writes — so one inflate serves
     /// all of them.
     inflated: std::collections::HashMap<String, Arc<compression::InflatedStream>>,
+    /// Memoised checksum-stripped `Partitions/*` streams, the loaded
+    /// families' documents left out where the framing reads
+    /// ([`Self::prepared_partition`]).
+    prepared: std::collections::HashMap<String, Arc<Vec<u8>>>,
+    /// Partitions read short or not at all, with why
+    /// ([`Self::partition_issues`]).
+    partition_issues: std::collections::BTreeMap<String, String>,
     /// Memoised `Partitions/NN` string-record extraction. The UTF-16
     /// decode over the whole partition is the single most expensive
     /// step after inflate, and unit recovery, storey names and the
@@ -250,11 +273,44 @@ impl RevitFile {
         if bytes.len() < 8 || bytes[..8] != [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1] {
             return Err(Error::NotACfbFile);
         }
-        let cfb = CompoundFile::open(Cursor::new(bytes)).map_err(|e| Error::Cfb(e.to_string()))?;
+        Self::from_source(Box::new(Cursor::new(bytes)), limits)
+    }
+
+    /// Open a Revit file read from `source` as its streams are asked for,
+    /// rather than held in memory: a file on disk, or a browser `File` read
+    /// in slices. The partitions are read a page at a time
+    /// ([`Self::prepared_partition`]), so the memory used is what is kept of
+    /// them, not the file's size.
+    pub fn open_source_with_limits(
+        mut source: impl FileSource + 'static,
+        limits: OpenLimits,
+    ) -> Result<Self> {
+        let len = source.seek(SeekFrom::End(0))?;
+        if len > limits.max_file_bytes {
+            return Err(Error::Cfb(format!(
+                "file size {len} exceeds limit {}",
+                limits.max_file_bytes
+            )));
+        }
+        source.rewind()?;
+        let mut magic = [0u8; 8];
+        if source.read_exact(&mut magic).is_err()
+            || magic != [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]
+        {
+            return Err(Error::NotACfbFile);
+        }
+        source.rewind()?;
+        Self::from_source(Box::new(source), limits)
+    }
+
+    fn from_source(source: Box<dyn FileSource>, limits: OpenLimits) -> Result<Self> {
+        let cfb = CompoundFile::open(source).map_err(|e| Error::Cfb(e.to_string()))?;
         Ok(Self {
             cfb,
             limits,
             inflated: std::collections::HashMap::new(),
+            prepared: std::collections::HashMap::new(),
+            partition_issues: Default::default(),
             partition_strings: None,
             second_prologue_ids: None,
             element_names: None,
@@ -317,23 +373,85 @@ impl RevitFile {
     /// loaded families embedded in keyed blocks are left out, which no reader
     /// of the project's elements asks for, and which on a large project are
     /// most of the bytes (Snowdon Towers: 195 of 444 MB). Elsewhere every
-    /// member is inflated.
+    /// member is inflated. At most
+    /// [`OpenLimits::max_inflated_partition_bytes`] are kept.
     pub fn inflated_partition(&mut self, name: &str) -> Result<Arc<compression::InflatedStream>> {
         if let Some(cached) = self.inflated.get(name) {
             return Ok(Arc::clone(cached));
         }
-        let raw = self.read_stream(name)?;
-        let members = self.marker_tags().and_then(|tags| {
-            let prepared = compression::prepare_stream_for_inflate(name, &raw);
-            crate::native_segments::document_members(&prepared, &tags).ok()
-        });
+        let prepared = self.prepared_partition(name)?;
+        let budget = self.limits.max_inflated_partition_bytes;
+        let members = self
+            .marker_tags()
+            .and_then(|tags| crate::native_segments::document_members(&prepared, &tags).ok());
         let inflated = Arc::new(match members {
-            Some(members) => compression::InflatedStream::from_members(name, &raw, &members),
-            None => compression::InflatedStream::from_stored(name, &raw),
+            Some(members) => compression::InflatedStream::from_members(&prepared, &members, budget),
+            None => compression::InflatedStream::from_prepared(&prepared, budget),
         });
+        if inflated.truncated() {
+            self.partition_issues.insert(
+                name.to_string(),
+                format!("inflated bytes over the limit of {budget}; the rest is left out"),
+            );
+        }
         self.inflated
             .insert(name.to_string(), Arc::clone(&inflated));
         Ok(inflated)
+    }
+
+    /// The checksum-stripped bytes of partition stream `name`, memoised:
+    /// what [`compression::prepare_stream_for_inflate`] makes of it, with
+    /// the keyed blocks (the loaded families' documents, RE-148) left out
+    /// where the segment markers read to their end. The stream is read a
+    /// page at a time and only what is kept is held, so a partition of
+    /// gigabytes whose project segments are a fraction of it fits in
+    /// memory. At most [`OpenLimits::max_stream_bytes`] are kept. Where
+    /// the markers do not read, the whole stream is read and stripped, as
+    /// [`Self::read_stream`] does.
+    pub fn prepared_partition(&mut self, name: &str) -> Result<Arc<Vec<u8>>> {
+        if let Some(cached) = self.prepared.get(name) {
+            return Ok(Arc::clone(cached));
+        }
+        let result = self.read_prepared_partition(name);
+        match result {
+            Ok(prepared) => {
+                let prepared = Arc::new(prepared);
+                self.prepared
+                    .insert(name.to_string(), Arc::clone(&prepared));
+                Ok(prepared)
+            }
+            Err(error) => {
+                self.partition_issues
+                    .insert(name.to_string(), error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    fn read_prepared_partition(&mut self, name: &str) -> Result<Vec<u8>> {
+        if compression::is_checksum_paged_stream(name) {
+            if let Some(tags) = self.marker_tags() {
+                let max = usize::try_from(self.limits.max_stream_bytes).unwrap_or(usize::MAX);
+                let stream = self.open_stream(name)?;
+                let pages = compression::StrippedPages::new(stream);
+                if let Ok(prepared) =
+                    crate::native_segments::read_document_stream(pages, &tags, max)
+                {
+                    return Ok(prepared);
+                }
+            }
+        }
+        let raw = self.read_stream(name)?;
+        Ok(compression::prepare_stream_for_inflate(name, &raw).into_owned())
+    }
+
+    /// Partitions read short or not at all, and why: a stream over
+    /// [`OpenLimits::max_stream_bytes`], or inflated bytes over
+    /// [`OpenLimits::max_inflated_partition_bytes`]. The readers of
+    /// partitions go on without what is missing, so a caller wanting to
+    /// tell a model read in full from one read in part asks here.
+    pub fn partition_issues(&self) -> &std::collections::BTreeMap<String, String> {
+        &self.partition_issues
     }
 
     /// The partition framing tags of the file's schema, memoised.
@@ -506,15 +624,7 @@ impl RevitFile {
     /// declared size (or read position) exceeds this returns
     /// `Error::Cfb("stream exceeds limit…")`.
     pub fn read_stream_with_limit(&mut self, name: &str, max_bytes: u64) -> Result<Vec<u8>> {
-        let path = if name.starts_with('/') {
-            name.to_string()
-        } else {
-            format!("/{name}")
-        };
-        let mut stream = self
-            .cfb
-            .open_stream(&path)
-            .map_err(|_| Error::StreamNotFound(name.to_string()))?;
+        let mut stream = self.open_stream(name)?;
         // Stream size is known up-front from the CFB directory entry.
         // Reject before reading.
         let stream_size = stream.len();
@@ -541,6 +651,17 @@ impl RevitFile {
             out.extend_from_slice(&buf[..n]);
         }
         Ok(out)
+    }
+
+    fn open_stream(&mut self, name: &str) -> Result<cfb::Stream<Box<dyn FileSource>>> {
+        let path = if name.starts_with('/') {
+            name.to_string()
+        } else {
+            format!("/{name}")
+        };
+        self.cfb
+            .open_stream(&path)
+            .map_err(|_| Error::StreamNotFound(name.to_string()))
     }
 
     /// Parse `BasicFileInfo`.

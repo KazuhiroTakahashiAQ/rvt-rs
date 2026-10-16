@@ -491,8 +491,12 @@ fn extract_records_with(
     let mut holders: RecordHolders = BTreeMap::new();
     for name in names.iter().filter(|_| memoised.is_none()) {
         let partition: u32 = name[11..].parse()?;
-        let stored = file.read_stream_with_limit(name, options.max_stream_bytes)?;
-        let prepared = compression::prepare_stream_for_inflate(name, &stored);
+        let prepared = file.prepared_partition(name)?;
+        ensure!(
+            prepared.len() as u64 <= options.max_stream_bytes,
+            "stream '{name}' exceeds limit {}",
+            options.max_stream_bytes
+        );
         let inflated = file.inflated_partition(name).ok();
         native_segments::walk_document(
             &prepared,
@@ -546,8 +550,12 @@ fn extract_records_with(
     let mut seen_ids = BTreeSet::new();
     for name in names {
         let partition: u32 = name[11..].parse()?;
-        let stored = file.read_stream_with_limit(&name, options.max_stream_bytes)?;
-        let prepared = compression::prepare_stream_for_inflate(&name, &stored);
+        let prepared = file.prepared_partition(&name)?;
+        ensure!(
+            prepared.len() as u64 <= options.max_stream_bytes,
+            "stream '{name}' exceeds limit {}",
+            options.max_stream_bytes
+        );
         let inflated = file.inflated_partition(&name).ok();
         let stats = native_segments::walk_document(
             &prepared,
