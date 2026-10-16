@@ -3,7 +3,9 @@
 //! Content is a loose structure of UTF-16LE strings interleaved with binary
 //! markers. The fields we reliably extract across 2016-2026:
 //!
-//! - Version (4-digit year) — preceded by `\x04\x00` in the raw bytes
+//! - Version (4-digit year) — the `Format` line of the text block below
+//!   (2019+), else the header's UTF-16 string with a u32 count of 4
+//!   (`\x04\x00\x00\x00`)
 //! - Build string — either `(Build: YYYYMMDD_HHMM(x64))` or `YYYYMMDD_HHMM(x64)`
 //! - Original local file path (embedded by the creator's filesystem)
 //! - File GUID — standard UUID notation, sometimes repeated
@@ -128,8 +130,15 @@ impl BasicFileInfo {
         let properties = parse_properties(data);
         let prop = |key: &str| lookup(&properties, key);
 
-        let version = extract_version(&raw)
-            .or_else(|| prop("Format").and_then(parse_release_year))
+        // The text block's `Format` line, then the header's release string;
+        // the first year-like number of the text only where both are
+        // missing. On a workshared file the header writes the central model
+        // path before the release, and a year in that path (a folder named
+        // `…_20261225`) read a Revit 2024 file as 2026.
+        let version = prop("Format")
+            .and_then(parse_release_year)
+            .or_else(|| extract_header_version(data))
+            .or_else(|| extract_version(&raw))
             .ok_or_else(|| Error::BasicFileInfo("no 4-digit Revit version found".into()))?;
         let build = extract_build(&raw).or_else(|| prop("Build").map(str::to_string));
         let original_path =
@@ -448,6 +457,23 @@ fn parse_release_year(value: &str) -> Option<u32> {
         .filter(|y| RELEASE_YEARS.contains(y))
 }
 
+/// The header's release string: a u32 character count of 4, then the year
+/// in UTF-16LE (`04 00 00 00 32 00 30 00 32 00 34 00`). A path or another
+/// string never holds that count right before its digits.
+fn extract_header_version(data: &[u8]) -> Option<u32> {
+    data.windows(12).find_map(|w| {
+        if w[..4] != [4, 0, 0, 0] {
+            return None;
+        }
+        let digits = [w[4], w[6], w[8], w[10]];
+        if [w[5], w[7], w[9], w[11]] != [0; 4] || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let year = digits.iter().fold(0, |n, d| n * 10 + u32::from(d - b'0'));
+        RELEASE_YEARS.contains(&year).then_some(year)
+    })
+}
+
 fn extract_version(text: &str) -> Option<u32> {
     // Two patterns seen:
     //   "Autodesk Revit 2018 (Build: 20170130_1515(x64))"   <- 2016-2018
@@ -590,4 +616,45 @@ fn extract_locale(text: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wide(s: &str) -> Vec<u8> {
+        let mut out = (s.encode_utf16().count() as u32).to_le_bytes().to_vec();
+        out.extend(s.encode_utf16().flat_map(u16::to_le_bytes));
+        out
+    }
+
+    /// A workshared file's header: the central model path, then the release.
+    #[test]
+    fn release_after_a_central_path_with_a_year_in_it() {
+        let mut data = vec![0x0e, 0, 0, 0, 1, 0, 0, 0, 0, 0];
+        data.extend(wide(r"C:\Projects\Share_20261225\Model.rvt"));
+        data.extend(wide("2024"));
+        data.extend(wide("20230911_1230(x64)"));
+        let info = BasicFileInfo::from_bytes(&data).unwrap();
+        assert_eq!(info.version, 2024);
+        assert_eq!(info.build.as_deref(), Some("20230911_1230(x64)"));
+    }
+
+    /// Text without the header's counted strings keeps the first year.
+    #[test]
+    fn encoded_text_round_trips() {
+        let info = BasicFileInfo {
+            version: 2019,
+            build: Some("20180123_1515(x64)".into()),
+            original_path: Some(r"C:\a\b.rvt".into()),
+            guid: None,
+            locale: Some("ENU".into()),
+            properties: Vec::new(),
+            raw_text: String::new(),
+        };
+        assert_eq!(
+            BasicFileInfo::from_bytes(&info.encode()).unwrap().version,
+            2019
+        );
+    }
 }
