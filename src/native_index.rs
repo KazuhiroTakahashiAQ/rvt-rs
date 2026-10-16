@@ -29,7 +29,17 @@ pub fn storage_increments(bytes: &[u8], registry: &Registry) -> Result<Vec<Incre
             .is_some_and(|c| c.name == "DocumentIncrementTable"),
         "unsupported increment root class"
     );
-    let root = native_parameters::decode_object_fields(bytes, registry, 2, tag)?;
+    // A row per save of the document: a workshared project saved 1,448
+    // times holds more values than the default graph budget. Every value
+    // takes at least a byte, so the stream's length bounds them.
+    let default = native_parameters::GraphLimits::default();
+    let limits = native_parameters::GraphLimits {
+        max_values: default.max_values.max(bytes.len()),
+        max_objects: default.max_objects.max(bytes.len()),
+        ..default
+    };
+    let root =
+        native_parameters::decode_object_fields_with_limits(bytes, registry, 2, tag, limits)?;
     ensure!(
         bytes.get(root.end..) == Some(&[0; 4]),
         "unsupported increment table terminal"
