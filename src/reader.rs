@@ -118,6 +118,9 @@ pub struct RevitFile {
     /// Memoised partitions holding each record of a set of channels, for
     /// [`crate::native_document::extract_graphs_selected`].
     record_holders: std::collections::HashMap<Vec<u64>, Arc<crate::native_document::RecordHolders>>,
+    /// Memoised partition framing tags of the file's schema, `None` inside
+    /// when the schema does not give them.
+    marker_tags: Option<Option<crate::native_segments::MarkerTags>>,
 }
 
 /// A partition stream's data objects, each at its offset (RE-153).
@@ -260,6 +263,7 @@ impl RevitFile {
             data_objects: std::collections::HashMap::new(),
             native_preamble: None,
             record_holders: Default::default(),
+            marker_tags: None,
         })
     }
 
@@ -299,22 +303,49 @@ impl RevitFile {
         self.data_objects.clear();
     }
 
-    /// Read and inflate every gzip member of `name`, memoised.
+    /// Read and inflate the gzip members of `name`, memoised.
     ///
     /// Repeat calls return the same shared buffer instead of reading
     /// the CFB stream and inflating it again. Use this for any
     /// multi-member stream a pipeline touches more than once —
     /// `Partitions/*` above all, where a geometry export otherwise
     /// inflates the same ~180 MiB a dozen times over.
+    ///
+    /// Where the partition's segment markers read to their end, only the
+    /// document's own segments are inflated
+    /// ([`crate::native_segments::document_members`]): the documents of the
+    /// loaded families embedded in keyed blocks are left out, which no reader
+    /// of the project's elements asks for, and which on a large project are
+    /// most of the bytes (Snowdon Towers: 195 of 444 MB). Elsewhere every
+    /// member is inflated.
     pub fn inflated_partition(&mut self, name: &str) -> Result<Arc<compression::InflatedStream>> {
         if let Some(cached) = self.inflated.get(name) {
             return Ok(Arc::clone(cached));
         }
         let raw = self.read_stream(name)?;
-        let inflated = Arc::new(compression::InflatedStream::from_stored(name, &raw));
+        let members = self.marker_tags().and_then(|tags| {
+            let prepared = compression::prepare_stream_for_inflate(name, &raw);
+            crate::native_segments::document_members(&prepared, &tags).ok()
+        });
+        let inflated = Arc::new(match members {
+            Some(members) => compression::InflatedStream::from_members(name, &raw, &members),
+            None => compression::InflatedStream::from_stored(name, &raw),
+        });
         self.inflated
             .insert(name.to_string(), Arc::clone(&inflated));
         Ok(inflated)
+    }
+
+    /// The partition framing tags of the file's schema, memoised.
+    fn marker_tags(&mut self) -> Option<crate::native_segments::MarkerTags> {
+        if self.marker_tags.is_none() {
+            let tags = crate::native_document::read_single(self, "Formats/Latest")
+                .ok()
+                .and_then(|formats| crate::schema_registry::parse(&formats).ok())
+                .and_then(|registry| crate::native_segments::MarkerTags::new(&registry).ok());
+            self.marker_tags = Some(tags);
+        }
+        self.marker_tags.flatten()
     }
 
     /// The data objects (RE-153) of partition stream `name`, each at its
