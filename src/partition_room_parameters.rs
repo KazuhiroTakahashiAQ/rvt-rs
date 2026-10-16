@@ -278,6 +278,109 @@ pub fn enclosing_data_object(buf: &[u8], at: usize) -> Option<u32> {
     }
 }
 
+/// [`enclosing_data_object`] for many offsets of one buffer, the same answer
+/// from its one-pass [`data_objects`] instead of a backward search that
+/// verifies each candidate's Adler-32 again for every offset.
+///
+/// The one pass visits every offset outside the objects it accepts, so a
+/// verified header it did not list starts inside one of them. For an offset
+/// inside the listed object `f` before it, the backward search returns the
+/// last header in its window between `f`'s and the offset whose payload
+/// reaches past the offset, else `f`: the plausible headers inside `f` are
+/// listed once, and only those reaching past the offset are verified, each
+/// once. An offset past the end of `f` is rare and searched as before.
+pub struct EnclosingDataObjects<'a> {
+    buf: &'a [u8],
+    adler: Adler32Ranges<'a>,
+    objects: &'a [(usize, DataObject)],
+    /// By index into `objects`: the plausible headers inside it, as
+    /// (offset, end of payload).
+    inner: std::collections::HashMap<usize, Vec<(usize, usize)>>,
+    verified: std::collections::HashMap<usize, Option<DataObject>>,
+}
+
+impl<'a> EnclosingDataObjects<'a> {
+    /// `objects` is [`data_objects`] of `buf`.
+    pub fn new(buf: &'a [u8], objects: &'a [(usize, DataObject)]) -> Self {
+        Self {
+            buf,
+            adler: Adler32Ranges::new(buf),
+            objects,
+            inner: Default::default(),
+            verified: Default::default(),
+        }
+    }
+
+    /// [`enclosing_data_object`]`(buf, at)`.
+    pub fn at(&mut self, at: usize) -> Option<u32> {
+        let last = at.checked_sub(DATA_OBJECT_HEADER)?;
+        let low = at.saturating_sub(DATA_OBJECT_SEARCH);
+        // No listed object starts at or before `last`: no verified header does.
+        let i = self
+            .objects
+            .partition_point(|(p, _)| *p <= last)
+            .checked_sub(1)?;
+        let (p, object) = self.objects[i];
+        if object.end <= at {
+            return enclosing_data_object(self.buf, at);
+        }
+        let buf = self.buf;
+        let inner = self
+            .inner
+            .entry(i)
+            .or_insert_with(|| plausible_headers(buf, p + 1, object.end));
+        let before = inner.partition_point(|(q, _)| *q <= last);
+        for &(q, end) in inner[..before].iter().rev() {
+            if q < low {
+                break;
+            }
+            if end <= at {
+                continue;
+            }
+            let adler = &mut self.adler;
+            if let Some(found) = *self
+                .verified
+                .entry(q)
+                .or_insert_with(|| verified_in(adler, q))
+            {
+                return Some(found.element_id);
+            }
+        }
+        (p >= low).then_some(object.element_id)
+    }
+}
+
+/// Offsets in `from..to` where a data object's header could start: its zero
+/// word and its size, in the header and ending the payload, agree; with the
+/// payload's end. The Adler-32 is not checked.
+fn plausible_headers(buf: &[u8], from: usize, to: usize) -> Vec<(usize, usize)> {
+    let u32_at = |p: usize| u32::from_le_bytes(buf[p..p + 4].try_into().expect("4 bytes"));
+    let to = to.min((buf.len() + 1).saturating_sub(DATA_OBJECT_HEADER));
+    let mut out = Vec::new();
+    for q in from..to {
+        if u32_at(q + 4) != 0 {
+            continue;
+        }
+        let size = u32_at(q + 12) as usize;
+        let end = (q + DATA_OBJECT_HEADER).saturating_add(size);
+        if size >= 4 && end <= buf.len() && u32_at(end - 4) as usize == size {
+            out.push((q, end));
+        }
+    }
+    out
+}
+
+/// The listed data objects of partition stream `stream`, or, should listing
+/// fail where inflating did not, the one pass over `buf` again.
+fn listed_objects(
+    rf: &mut RevitFile,
+    stream: &str,
+    buf: &[u8],
+) -> crate::reader::PartitionDataObjects {
+    rf.partition_data_objects(stream)
+        .unwrap_or_else(|_| std::sync::Arc::new(data_objects(buf)))
+}
+
 /// Every verified data object in `buf` (RE-153), with its header's offset,
 /// in one pass: a header is tried only where its zero word, its size and the
 /// size that ends its payload agree, before its Adler-32 is computed. Use it
@@ -285,6 +388,7 @@ pub fn enclosing_data_object(buf: &[u8], at: usize) -> Option<u32> {
 /// buffer, each a backward search of up to [`DATA_OBJECT_SEARCH`] bytes.
 pub fn data_objects(buf: &[u8]) -> Vec<(usize, DataObject)> {
     let u32_at = |p: usize| u32::from_le_bytes(buf[p..p + 4].try_into().expect("4 bytes"));
+    let mut adler = Adler32Ranges::new(buf);
     let mut out = Vec::new();
     let mut p = 0;
     while p + DATA_OBJECT_HEADER <= buf.len() {
@@ -295,7 +399,7 @@ pub fn data_objects(buf: &[u8]) -> Vec<(usize, DataObject)> {
         let end = (p + DATA_OBJECT_HEADER).saturating_add(size);
         let plausible =
             u32_at(p + 4) == 0 && size >= 4 && end <= buf.len() && u32_at(end - 4) as usize == size;
-        match plausible.then(|| verified_data_object(buf, p)).flatten() {
+        match plausible.then(|| verified_in(&mut adler, p)).flatten() {
             Some(object) => {
                 out.push((p, object));
                 p = object.end;
@@ -304,6 +408,98 @@ pub fn data_objects(buf: &[u8]) -> Vec<(usize, DataObject)> {
         }
     }
     out
+}
+
+/// [`verified_data_object`]`(adler.buf, p)`, the Adler-32 from `adler`.
+fn verified_in(adler: &mut Adler32Ranges, p: usize) -> Option<DataObject> {
+    let buf = adler.buf;
+    let u32_at = |p: usize| {
+        buf.get(p..p.checked_add(4)?)
+            .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
+    };
+    if u32_at(p.checked_add(4)?)? != 0 {
+        return None;
+    }
+    let (id, sum, size, class) = (u32_at(p)?, u32_at(p + 8)?, u32_at(p + 12)?, u32_at(p + 16)?);
+    let size = size as usize;
+    let end = p.checked_add(DATA_OBJECT_HEADER)?.checked_add(size)?;
+    if size < 4 || end > buf.len() || u32_at(end - 4) != Some(size as u32) {
+        return None;
+    }
+    // The class word is the 4 bytes before the payload.
+    (adler.checksum(p + 16, end - 4) == sum).then_some(DataObject {
+        element_id: id,
+        class,
+        end,
+    })
+}
+
+const ADLER_MOD: u64 = 65_521;
+const ADLER_BLOCK: usize = 1 << 16;
+
+/// The Adler-32 of any range of one buffer, from running sums kept at every
+/// [`ADLER_BLOCK`] bytes, built when a range first spans several: a long
+/// range costs its two partial blocks, not its length. Plausible headers
+/// whose size reaches hundreds of megabytes ahead are common, and each cost
+/// an Adler-32 over all of those bytes.
+struct Adler32Ranges<'a> {
+    buf: &'a [u8],
+    /// `(Σ d[i], Σ i·d[i])` mod [`ADLER_MOD`] over `buf[..k * ADLER_BLOCK]`.
+    sums: Option<Vec<(u32, u32)>>,
+}
+
+impl<'a> Adler32Ranges<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, sums: None }
+    }
+
+    /// `(Σ d[i], Σ i·d[i])` mod [`ADLER_MOD`] over `buf[from..to]`, from
+    /// its Adler-32: `a = 1 + Σ d[i]`, `b = n + Σ (to - i)·d[i]`.
+    fn piece(buf: &[u8], from: usize, to: usize) -> (u64, u64) {
+        let mut adler = simd_adler32::Adler32::new();
+        adler.write(&buf[from..to]);
+        let sum = u64::from(adler.finish());
+        let (a, b) = (sum & 0xffff, sum >> 16);
+        let n = (to - from) as u64 % ADLER_MOD;
+        let total = (a + ADLER_MOD - 1) % ADLER_MOD;
+        let weighted_to = (b + ADLER_MOD - n) % ADLER_MOD;
+        let weighted = ((to as u64 % ADLER_MOD) * total + ADLER_MOD - weighted_to) % ADLER_MOD;
+        (total, weighted)
+    }
+
+    /// The Adler-32 of `buf[from..to]`.
+    fn checksum(&mut self, from: usize, to: usize) -> u32 {
+        let (first, last) = (from.div_ceil(ADLER_BLOCK), to / ADLER_BLOCK);
+        if first + 4 > last {
+            let mut adler = simd_adler32::Adler32::new();
+            adler.write(&self.buf[from..to]);
+            return adler.finish();
+        }
+        let buf = self.buf;
+        let sums = self.sums.get_or_insert_with(|| {
+            let mut sums = Vec::with_capacity(buf.len() / ADLER_BLOCK + 1);
+            let (mut total, mut weighted) = (0, 0);
+            sums.push((0, 0));
+            for k in 0..buf.len() / ADLER_BLOCK {
+                let (t, w) = Self::piece(buf, k * ADLER_BLOCK, (k + 1) * ADLER_BLOCK);
+                total = (total + t) % ADLER_MOD;
+                weighted = (weighted + w) % ADLER_MOD;
+                sums.push((total as u32, weighted as u32));
+            }
+            sums
+        });
+        let (head_t, head_w) = Self::piece(buf, from, first * ADLER_BLOCK);
+        let (tail_t, tail_w) = Self::piece(buf, last * ADLER_BLOCK, to);
+        let (lo, hi) = (sums[first], sums[last]);
+        let mid_t = u64::from(hi.0) + ADLER_MOD - u64::from(lo.0);
+        let mid_w = u64::from(hi.1) + ADLER_MOD - u64::from(lo.1);
+        let total = (head_t + mid_t + tail_t) % ADLER_MOD;
+        let weighted = (head_w + mid_w + tail_w) % ADLER_MOD;
+        let n = (to - from) as u64 % ADLER_MOD;
+        let a = (1 + total) % ADLER_MOD;
+        let b = (n + (to as u64 % ADLER_MOD) * total + ADLER_MOD - weighted) % ADLER_MOD;
+        ((b << 16) | a) as u32
+    }
 }
 
 /// A data object whose header starts at a known offset (RE-153).
@@ -380,12 +576,13 @@ pub fn scan_text_parameter(
             continue;
         };
         let buf = inflated.bytes();
+        let objects = listed_objects(rf, &stream, buf);
+        let mut enclosing = EnclosingDataObjects::new(buf, &objects);
         for hit in memchr::memmem::find_iter(buf, &tag) {
             let Some(value) = utf16_entry(buf, hit + tag.len(), 256) else {
                 continue;
             };
-            let Some(element) = enclosing_data_object(buf, hit).filter(|id| elements.contains(id))
-            else {
+            let Some(element) = enclosing.at(hit).filter(|id| elements.contains(id)) else {
                 continue;
             };
             match found.get_mut(&element) {
@@ -432,12 +629,13 @@ pub fn scan_integer_parameter(
             continue;
         };
         let buf = inflated.bytes();
+        let objects = listed_objects(rf, &stream, buf);
+        let mut enclosing = EnclosingDataObjects::new(buf, &objects);
         for hit in memchr::memmem::find_iter(buf, &tag) {
             let Some(value) = read_u32(buf, hit + tag.len()) else {
                 continue;
             };
-            let Some(element) = enclosing_data_object(buf, hit).filter(|id| elements.contains(id))
-            else {
+            let Some(element) = enclosing.at(hit).filter(|id| elements.contains(id)) else {
                 continue;
             };
             match found.get_mut(&element) {
@@ -486,6 +684,8 @@ pub fn find_parameter_definitions(rf: &mut RevitFile, revit_version: u32) -> BTr
             continue;
         };
         let buf = inflated.bytes();
+        let objects = listed_objects(rf, &stream, buf);
+        let mut enclosing = EnclosingDataObjects::new(buf, &objects);
         for hit in memchr::memmem::find_iter(buf, &needle) {
             let Some(group) = hit.checked_sub(4).and_then(|at| utf16_entry(buf, at, 256)) else {
                 continue;
@@ -494,7 +694,10 @@ pub fn find_parameter_definitions(rf: &mut RevitFile, revit_version: u32) -> BTr
             let name = (after..after + PARAMETER_NAME_WINDOW).find_map(|at| {
                 utf16_entry(buf, at, 256).filter(|name| name.encode_utf16().count() >= 2)
             });
-            let (Some(name), Some(id)) = (name, enclosing_data_object(buf, hit)) else {
+            let Some(name) = name else {
+                continue;
+            };
+            let Some(id) = enclosing.at(hit) else {
                 continue;
             };
             match found.get_mut(&name) {
@@ -628,4 +831,38 @@ pub fn scan_room_parameter_entries(
         .into_iter()
         .filter_map(|(id, pair)| pair.map(|p| (id, p)))
         .collect()
+}
+
+#[cfg(test)]
+mod adler_range_tests {
+    use super::*;
+
+    #[test]
+    fn range_checksum_matches_a_direct_one() {
+        let mut x: u32 = 0x1234_5678;
+        let buf: Vec<u8> = (0..20 * ADLER_BLOCK + 777)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                if x % 3 == 0 { 0xff } else { x as u8 }
+            })
+            .collect();
+        let mut ranges = Adler32Ranges::new(&buf);
+        let b = ADLER_BLOCK;
+        for (from, to) in [
+            (0, buf.len()),
+            (1, buf.len() - 1),
+            (b, 9 * b),
+            (b - 1, 9 * b + 1),
+            (3, 5 * b),
+            (7 * b + 5, 19 * b + 3),
+            (100, 300),
+            (b + 1, 4 * b + 2),
+        ] {
+            let mut direct = simd_adler32::Adler32::new();
+            direct.write(&buf[from..to]);
+            assert_eq!(ranges.checksum(from, to), direct.finish(), "{from}..{to}");
+        }
+    }
 }
