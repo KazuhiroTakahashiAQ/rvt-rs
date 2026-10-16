@@ -494,7 +494,7 @@ fn extract_records_with(
         let stored = file.read_stream_with_limit(name, options.max_stream_bytes)?;
         let prepared = compression::prepare_stream_for_inflate(name, &stored);
         let inflated = file.inflated_partition(name).ok();
-        native_segments::walk_inflated(
+        native_segments::walk_document(
             &prepared,
             inflated.as_deref(),
             registry,
@@ -549,7 +549,7 @@ fn extract_records_with(
         let stored = file.read_stream_with_limit(&name, options.max_stream_bytes)?;
         let prepared = compression::prepare_stream_for_inflate(&name, &stored);
         let inflated = file.inflated_partition(&name).ok();
-        let stats = native_segments::walk_inflated(
+        let stats = native_segments::walk_document(
             &prepared,
             inflated.as_deref(),
             registry,

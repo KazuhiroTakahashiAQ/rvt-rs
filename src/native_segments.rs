@@ -98,20 +98,112 @@ pub fn walk_inflated(
     max_group_bytes: usize,
     mut callback: impl FnMut(&GroupSource, &[u8]) -> Result<()>,
 ) -> Result<Statistics> {
+    let tags = MarkerTags::new(registry)?;
+    walk_framing(
+        prepared,
+        inflated,
+        &tags,
+        max_group_bytes,
+        Inflate::All,
+        &mut |_, _, _| {},
+        &mut callback,
+    )
+}
+/// [`walk_inflated`] for a reader of the document's own records: the groups
+/// of keyed blocks, the documents of the loaded families (RE-148, RE-163),
+/// are not inflated and reach `callback` with no bytes. Their framing is
+/// checked all the same, and the statistics count their segments' ISIZE.
+pub fn walk_document(
+    prepared: &[u8],
+    inflated: Option<&InflatedStream>,
+    registry: &Registry,
+    max_group_bytes: usize,
+    mut callback: impl FnMut(&GroupSource, &[u8]) -> Result<()>,
+) -> Result<Statistics> {
+    let tags = MarkerTags::new(registry)?;
+    walk_framing(
+        prepared,
+        inflated,
+        &tags,
+        max_group_bytes,
+        Inflate::Unkeyed,
+        &mut |_, _, _| {},
+        &mut callback,
+    )
+}
+/// Where the gzip member of each segment outside every keyed block starts in
+/// `prepared`, with its ISIZE: the members of the document's own records, without the
+/// documents of the loaded families embedded in keyed blocks (RE-148,
+/// RE-163). On a large project those are most of the partition (a Revit 2024
+/// project of large: most inflated). The markers are read and
+/// checked as [`walk`] does; nothing is inflated.
+pub fn document_members(prepared: &[u8], tags: &MarkerTags) -> Result<Vec<(usize, u32)>> {
+    let mut members = Vec::new();
+    walk_framing(
+        prepared,
+        None,
+        tags,
+        usize::MAX,
+        Inflate::None,
+        &mut |at, keyed, isize| {
+            if !keyed {
+                members.push((at, isize));
+            }
+        },
+        &mut |_, _| Ok(()),
+    )?;
+    Ok(members)
+}
+/// The schema tags of the partition framing markers.
+#[derive(Debug, Clone, Copy)]
+pub struct MarkerTags {
+    content: u16,
+    content_key: u16,
+    segment: u16,
+    checkback: u16,
+    /// The 2016 and 2017 schemas have no `SignatureMarker` class and their
+    /// partitions write none (#421); it is required only where it is met.
+    signature: Option<u16>,
+}
+impl MarkerTags {
+    pub fn new(registry: &Registry) -> Result<Self> {
+        let tag = |name: &str| {
+            registry
+                .named(name)
+                .map(|c| c.tag)
+                .ok_or_else(|| anyhow::anyhow!("partition schema class absent: {name}"))
+        };
+        Ok(Self {
+            content: tag("ContentMarker")?,
+            content_key: tag("ContentKey")?,
+            segment: tag("SegmentMarker")?,
+            checkback: tag("SegmentCheckback")?,
+            signature: registry.named("SignatureMarker").map(|c| c.tag),
+        })
+    }
+}
+/// Which segments [`walk_framing`] inflates.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Inflate {
+    All,
+    /// Those outside every keyed block.
+    Unkeyed,
+    None,
+}
+/// The marker walk behind [`walk_inflated`], [`walk_document`] and
+/// [`document_members`]. `on_segment` sees where each segment's gzip member
+/// starts, whether it lies in a keyed block and its ISIZE; a segment not
+/// inflated adds no bytes to its group.
+fn walk_framing(
+    prepared: &[u8],
+    inflated: Option<&InflatedStream>,
+    tags: &MarkerTags,
+    max_group_bytes: usize,
+    inflate: Inflate,
+    on_segment: &mut dyn FnMut(usize, bool, u32),
+    callback: &mut dyn FnMut(&GroupSource, &[u8]) -> Result<()>,
+) -> Result<Statistics> {
     ensure!(max_group_bytes > 0, "zero partition group budget");
-    let tag = |name: &str| {
-        registry
-            .named(name)
-            .map(|c| c.tag)
-            .ok_or_else(|| anyhow::anyhow!("partition schema class absent: {name}"))
-    };
-    let content_tag = tag("ContentMarker")?;
-    let content_key_tag = tag("ContentKey")?;
-    let segment_tag = tag("SegmentMarker")?;
-    let checkback_tag = tag("SegmentCheckback")?;
-    // The 2016 and 2017 schemas have no `SignatureMarker` class and their
-    // partitions write none (#421); it is required only where it is met.
-    let signature_tag = registry.named("SignatureMarker").map(|c| c.tag);
     let mut r = Reader {
         bytes: prepared,
         pos: 0,
@@ -125,7 +217,7 @@ pub fn walk_inflated(
     loop {
         let offset = r.pos;
         let next = r.u16()?;
-        if next == content_tag {
+        if next == tags.content {
             ensure!(
                 active.is_none(),
                 "content boundary interrupts continued segment"
@@ -137,7 +229,7 @@ pub fn walk_inflated(
                 r.u32()?
             } else {
                 ensure!(
-                    token == u32::MAX && r.u16()? == content_key_tag,
+                    token == u32::MAX && r.u16()? == tags.content_key,
                     "unsupported content key pointer"
                 );
                 let count = r.u32()?;
@@ -160,7 +252,7 @@ pub fn walk_inflated(
                 return Ok(stats);
             }
             stats.content_sections += 1;
-        } else if next == segment_tag {
+        } else if next == tags.segment {
             let flags = r.u32()?;
             let count = r.u32()?;
             let size = r.u32()?;
@@ -183,29 +275,43 @@ pub fn walk_inflated(
             let channel = r.u64()?;
             let compressed_at = r.pos;
             let compressed = r.take(size as usize - 8)?;
-            let bytes = match inflated
-                .and_then(|stream| whole_member(stream, compressed_at, compressed, max_group_bytes))
-            {
-                Some(member) => Cow::Borrowed(member),
-                None => {
-                    let mut decoder = flate2::bufread::GzDecoder::new(compressed);
-                    let mut bytes = Vec::new();
-                    (&mut decoder)
-                        .take(max_group_bytes as u64 + 1)
-                        .read_to_end(&mut bytes)?;
-                    ensure!(
-                        bytes.len() <= max_group_bytes,
-                        "inflated segment group budget exceeded"
-                    );
-                    ensure!(
-                        decoder.get_ref().is_empty(),
-                        "gzip does not consume exact declared segment boundary"
-                    );
-                    Cow::Owned(bytes)
-                }
+            // The gzip trailer's ISIZE: the member's inflated length.
+            let isize = u32::from_le_bytes(compressed[compressed.len() - 4..].try_into()?);
+            on_segment(compressed_at, content_key.is_some(), isize);
+            let inflates = match inflate {
+                Inflate::All => true,
+                Inflate::Unkeyed => content_key.is_none(),
+                Inflate::None => false,
+            };
+            let bytes = if !inflates {
+                stats.inflated_bytes += u64::from(isize);
+                Cow::Borrowed(&[][..])
+            } else {
+                let bytes = match inflated.and_then(|stream| {
+                    whole_member(stream, compressed_at, compressed, max_group_bytes)
+                }) {
+                    Some(member) => Cow::Borrowed(member),
+                    None => {
+                        let mut decoder = flate2::bufread::GzDecoder::new(compressed);
+                        let mut bytes = Vec::new();
+                        (&mut decoder)
+                            .take(max_group_bytes as u64 + 1)
+                            .read_to_end(&mut bytes)?;
+                        ensure!(
+                            bytes.len() <= max_group_bytes,
+                            "inflated segment group budget exceeded"
+                        );
+                        ensure!(
+                            decoder.get_ref().is_empty(),
+                            "gzip does not consume exact declared segment boundary"
+                        );
+                        Cow::Owned(bytes)
+                    }
+                };
+                stats.inflated_bytes += bytes.len() as u64;
+                bytes
             };
             stats.segments += 1;
-            stats.inflated_bytes += bytes.len() as u64;
             last_size = Some(size);
             let from_previous = flags & 1 != 0;
             let to_next = flags & 2 != 0;
@@ -247,13 +353,13 @@ pub fn walk_inflated(
                 callback(&source, &bytes)?;
                 stats.groups += 1;
             }
-        } else if next == checkback_tag {
+        } else if next == tags.checkback {
             ensure!(
                 last_size == Some(r.u32()?),
                 "segment checkback mismatch at {offset}"
             );
             last_size = None;
-        } else if Some(next) == signature_tag {
+        } else if Some(next) == tags.signature {
             ensure!(active.is_none(), "signature interrupts continued segment");
             let count = r.u32()? as usize;
             ensure!(count <= 1_000_000, "partition signature budget exceeded");

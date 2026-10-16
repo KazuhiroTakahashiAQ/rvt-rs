@@ -195,6 +195,9 @@ pub fn inflate_all_chunks_for_stream(stream_name: &str, stored: &[u8]) -> Vec<Ve
     inflate_all_chunks(prepared.as_ref())
 }
 
+/// Most inflated bytes one [`InflatedStream`] holds.
+const STREAM_INFLATE_BUDGET: usize = 1024 * 1024 * 1024;
+
 /// Every gzip member of one stored stream, inflated and concatenated.
 ///
 /// Built once per stream by [`crate::reader::RevitFile::inflated_partition`]
@@ -222,7 +225,7 @@ impl InflatedStream {
         let chunks = inflate_all_members_with_limits(
             prepared.as_ref(),
             InflateLimits::default(),
-            1024 * 1024 * 1024,
+            STREAM_INFLATE_BUDGET,
         );
         let total: usize = chunks.iter().map(|(_, _, chunk)| chunk.len()).sum();
         let mut concat = Vec::with_capacity(total);
@@ -240,6 +243,46 @@ impl InflatedStream {
             concat,
             chunk_ends,
             members,
+            crcs,
+        }
+    }
+
+    /// [`Self::from_stored`] holding only the members that start at the
+    /// offsets of `members` in the prepared stream, each with its ISIZE (its
+    /// gzip trailer's inflated length), in order: the document's own segments
+    /// of a partition ([`crate::native_segments::document_members`]). The
+    /// buffer is sized from the ISIZEs up front and each member appended as it
+    /// is inflated, so the stream is never held twice. The budgets are
+    /// [`Self::from_stored`]'s.
+    pub fn from_members(stream_name: &str, stored: &[u8], members: &[(usize, u32)]) -> Self {
+        let prepared = prepare_stream_for_inflate(stream_name, stored);
+        let declared = members
+            .iter()
+            .map(|&(_, isize)| isize as usize)
+            .fold(0usize, usize::saturating_add);
+        let mut concat = Vec::with_capacity(declared.min(STREAM_INFLATE_BUDGET));
+        let mut chunk_ends = Vec::with_capacity(members.len());
+        let mut offsets = Vec::with_capacity(members.len());
+        for &(offset, _) in members {
+            let Ok((chunk, consumed)) =
+                inflate_member_at_with_limits(prepared.as_ref(), offset, InflateLimits::default())
+            else {
+                continue;
+            };
+            if concat.len().saturating_add(chunk.len()) > STREAM_INFLATE_BUDGET {
+                break;
+            }
+            concat.extend_from_slice(&chunk);
+            chunk_ends.push(concat.len());
+            offsets.push((offset, consumed));
+        }
+        let crcs = (0..offsets.len())
+            .map(|_| std::sync::OnceLock::new())
+            .collect();
+        Self {
+            concat,
+            chunk_ends,
+            members: offsets,
             crcs,
         }
     }
