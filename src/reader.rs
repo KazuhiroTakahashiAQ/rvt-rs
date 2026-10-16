@@ -144,7 +144,26 @@ pub struct RevitFile {
     /// Memoised partition framing tags of the file's schema, `None` inside
     /// when the schema does not give them.
     marker_tags: Option<Option<crate::native_segments::MarkerTags>>,
+    /// Memoised `Global/ElemTable` records: an export's passes each parsed
+    /// the table again.
+    elem_records: Option<Arc<Vec<crate::elem_table::ElemRecord>>>,
+    /// Memoised material names (RE-58), with the release and the declared
+    /// ids they were read for.
+    material_names: Option<MaterialNames>,
+    /// Memoised type map materials (RE-58), with the release they were read
+    /// for.
+    type_material_names: Option<(u32, TypeMaterialNames)>,
 }
+
+/// Each type's map material names, by owner ElementId.
+type TypeMaterialNames = Arc<std::collections::BTreeMap<u32, Vec<String>>>;
+
+/// Material names by ElementId, with the release and declared ids read for.
+type MaterialNames = (
+    u32,
+    std::collections::BTreeSet<u32>,
+    Arc<std::collections::BTreeMap<u32, String>>,
+);
 
 /// A partition stream's data objects, each at its offset (RE-153).
 pub type PartitionDataObjects = Arc<Vec<(usize, crate::partition_room_parameters::DataObject)>>;
@@ -320,6 +339,9 @@ impl RevitFile {
             native_preamble: None,
             record_holders: Default::default(),
             marker_tags: None,
+            elem_records: None,
+            material_names: None,
+            type_material_names: None,
         })
     }
 
@@ -348,8 +370,8 @@ impl RevitFile {
 
     /// Drop what the handle memoised besides the inflated streams and the
     /// native extraction preamble, which reading native records needs again
-    /// (B82): the string records, element names, design options, walk and
-    /// data objects an export reads. They are computed again when asked for.
+    /// (B82): the string records, element names, design options, walk, data
+    /// objects, element table records and material names an export reads. They are computed again when asked for.
     pub fn release_export_caches(&mut self) {
         self.partition_strings = None;
         self.second_prologue_ids = None;
@@ -357,6 +379,58 @@ impl RevitFile {
         self.design_options = None;
         self.walk = None;
         self.data_objects.clear();
+        self.elem_records = None;
+        self.material_names = None;
+        self.type_material_names = None;
+    }
+
+    /// The memoised `Global/ElemTable` records, if read.
+    pub(crate) fn cached_elem_records(&self) -> Option<Arc<Vec<crate::elem_table::ElemRecord>>> {
+        self.elem_records.clone()
+    }
+
+    pub(crate) fn store_elem_records(&mut self, records: Arc<Vec<crate::elem_table::ElemRecord>>) {
+        self.elem_records = Some(records);
+    }
+
+    /// The memoised material names read for `revit_version` and `declared`.
+    pub(crate) fn cached_material_names(
+        &self,
+        revit_version: u32,
+        declared: &std::collections::BTreeSet<u32>,
+    ) -> Option<Arc<std::collections::BTreeMap<u32, String>>> {
+        self.material_names
+            .as_ref()
+            .filter(|(version, held, _)| *version == revit_version && held == declared)
+            .map(|(_, _, names)| Arc::clone(names))
+    }
+
+    pub(crate) fn store_material_names(
+        &mut self,
+        revit_version: u32,
+        declared: std::collections::BTreeSet<u32>,
+        names: Arc<std::collections::BTreeMap<u32, String>>,
+    ) {
+        self.material_names = Some((revit_version, declared, names));
+    }
+
+    /// The memoised type map materials read for `revit_version`.
+    pub(crate) fn cached_type_material_names(
+        &self,
+        revit_version: u32,
+    ) -> Option<TypeMaterialNames> {
+        self.type_material_names
+            .as_ref()
+            .filter(|(version, _)| *version == revit_version)
+            .map(|(_, names)| Arc::clone(names))
+    }
+
+    pub(crate) fn store_type_material_names(
+        &mut self,
+        revit_version: u32,
+        names: TypeMaterialNames,
+    ) {
+        self.type_material_names = Some((revit_version, names));
     }
 
     /// Read and inflate the gzip members of `name`, memoised.
