@@ -4,6 +4,37 @@ Copyright 2026 Griffin Long
 Licensed under the Apache License, Version 2.0 (see LICENSE).
 
 ==============================================================================
+This fork
+==============================================================================
+
+Modified by Kazuhiro Takahashi (2026), in the fork
+https://github.com/KazuhiroTakahashiAQ/rvt-rs (branch rvt-viewer), on top
+of upstream commit 120e2f9. The changes (see the fork's git history):
+
+  * ElemTable: read renumbered element tables (either id field may be the
+    ascending one); overflow-checked lengths on 32-bit (wasm32) targets.
+  * BasicFileInfo: take the Revit release from the `Format:` line and the
+    header's release string before any year-like number in the text.
+  * Partitions: read a partition a page at a time from a `Read + Seek`
+    source, keep only the project's own (unkeyed) segments, leave the loaded
+    families' documents un-inflated, check each gzip member's CRC-32 once,
+    and record partitions left unread by the size limits.
+  * Element extraction: `extract_graphs_selected` reads selected records
+    without walking every partition; the increment table is bounded by its
+    stream length; parameter data objects are found among the listed ones;
+    the element table, material names and type materials are cached, and
+    `release_export_caches` drops export caches.
+
+The fork remains licensed under the Apache License, Version 2.0, including
+the fork author's modifications; no other terms apply to it.
+
+The fork's changes were derived only from the rvt-rs source code and from
+observing the bytes of Revit files. The fork author did not use, inspect,
+or analyze RevitAPI.dll or any Autodesk program. Statements about
+RevitAPI.dll or other Autodesk software in CLEANROOM.md, README.md and
+docs/ describe the work of the upstream author, not of this fork.
+
+==============================================================================
 Trademark and attribution notices
 ==============================================================================
 
@@ -68,13 +99,13 @@ Apache-2.0 redistribution.
 Test-corpus attribution
 ==============================================================================
 
-The integration test suite uses the publicly-available
-`rac_basic_sample_family` RFA fixture family distributed by
-Autodesk as part of every Revit release, and curated into a
-Git-LFS-hosted repository by Andreas Philipp at
-https://github.com/phi-ag/rvt under the Unlicense. The sample
-family files themselves are Autodesk property; this project
-consumes them only for interoperability-verification testing and
-does not redistribute them (the phi-ag/rvt test corpus is pulled
-via LFS from their repo at `git clone` time; it is not vendored
-here).
+The integration test suite can use the `rac_basic_sample_family`
+RFA fixture family distributed by Autodesk as part of Revit releases,
+collected into a Git-LFS-hosted repository by Andreas Philipp at
+https://github.com/phi-ag/rvt. The sample files are Autodesk property
+and are not covered by that repository's own license: phi-ag/rvt lists
+them under Creative Commons BY-NC-SA 3.0 (non-commercial), and
+Autodesk's sample projects (research/autodesk-sample-projects.tsv) come
+from the same host under terms not checked here. This project (and this
+fork) does not distribute any of these files; they are fetched only for
+a test or measurement run, and their own terms apply.

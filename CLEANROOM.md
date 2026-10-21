@@ -1,5 +1,7 @@
 # Clean-room policy
 
+> **Note on this fork** (KazuhiroTakahashiAQ/rvt-rs): the policy below is upstream's and is kept unchanged. The fork's own changes (see [NOTICE](NOTICE)) were derived only from the rvt-rs source code and from observing the bytes of Revit files; the fork author did not use, inspect, or analyze RevitAPI.dll or any Autodesk program. The statements below about RevitAPI.dll and symbol tables describe the upstream author's work.
+
 rvt-rs is a clean-room implementation of a reader for the Autodesk
 Revit on-disk format. Every byte-level finding in the repo is derived
 from **public** sources. This document states the policy in

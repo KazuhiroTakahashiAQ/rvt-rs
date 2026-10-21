@@ -134,7 +134,7 @@ impl BasicFileInfo {
         // the first year-like number of the text only where both are
         // missing. On a workshared file the header writes the central model
         // path before the release, and a year in that path (a folder named
-        // `…_2031`) read a Revit 2024 file as 2026.
+        // `…_2031`) read a Revit 2024 file as 2031.
         let version = prop("Format")
             .and_then(parse_release_year)
             .or_else(|| extract_header_version(data))

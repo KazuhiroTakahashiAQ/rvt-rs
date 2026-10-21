@@ -10,7 +10,6 @@
 //! `reports/` write-ups index it directly.
 //!
 //! Useful for:
-//!   - feeding decompressed streams to Ghidra / IDA / radare2
 //!   - diffing streams with `xxd` / `hexdump` between versions
 //!   - building a corpus for future Phase D work
 

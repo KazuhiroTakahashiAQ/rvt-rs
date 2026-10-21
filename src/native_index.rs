@@ -29,8 +29,8 @@ pub fn storage_increments(bytes: &[u8], registry: &Registry) -> Result<Vec<Incre
             .is_some_and(|c| c.name == "DocumentIncrementTable"),
         "unsupported increment root class"
     );
-    // A row per save of the document: a workshared project saved many
-    // times holds more values than the default graph budget. Every value
+    // A row per save of the document: a project saved many
+    // times can hold more values than the default graph budget. Every value
     // takes at least a byte, so the stream's length bounds them.
     let default = native_parameters::GraphLimits::default();
     let limits = native_parameters::GraphLimits {

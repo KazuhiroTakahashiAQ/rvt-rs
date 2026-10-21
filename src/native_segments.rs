@@ -134,8 +134,7 @@ pub fn walk_document(
 /// Where the gzip member of each segment outside every keyed block starts in
 /// `prepared`, with its ISIZE: the members of the document's own records, without the
 /// documents of the loaded families embedded in keyed blocks (RE-148,
-/// RE-163). On a large project those are most of the partition (a Revit 2024
-/// project of large: most inflated). The markers are read and
+/// RE-163). On a large project those can be most of the partition. The markers are read and
 /// checked as [`walk`] does; nothing is inflated.
 pub fn document_members(prepared: &[u8], tags: &MarkerTags) -> Result<Vec<(usize, u32)>> {
     let mut members = Vec::new();

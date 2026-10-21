@@ -178,9 +178,9 @@ fn u32_at(d: &[u8], at: usize) -> Option<u32> {
 ///
 /// The table is ordered by each element's current ElementId, its record's
 /// second id ([`ElemRecord::id_secondary`], RE-41). The first id rises too
-/// on most files, but a renumbered element keeps an earlier id there: a
-/// Revit 2026 project (a recent build) has thousands such records of about 100,000,
-/// 169 of them out of order, so the ids of either field may rise.
+/// on most files, but a renumbered element keeps an earlier id there: on
+/// such a file the first ids fall out of order in places, so the ids of
+/// either field may rise.
 pub fn detect_layout(d: &[u8]) -> ElemTableLayout {
     let fallback = ElemTableLayout {
         start: 0x30,
